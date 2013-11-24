@@ -1,0 +1,342 @@
+#!/usr/bin/python
+# Copyright 2013 Gandi SAS
+#
+# This file is part of Ansible
+#
+# Ansible is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Ansible is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+
+DOCUMENTATION = '''
+---
+module: gandi
+version_added: "1.4"
+short_description: create or terminate Gandi servers
+description:
+     - Manage of Gandi VPS
+options:
+  image:
+    description:
+       - image string to use for the instance
+    required: false
+    default: "debian-7"
+    aliases: []
+  instance_names:
+    description:
+       - a comma-separated list of instance names to create or destroy
+    required: false
+    default: null
+    aliases: []
+  machine_type:
+    description:
+       - type of machine to create, default small
+    required: false
+    default = "small"
+  name:
+    description:
+      - identifier when working with a single instance
+    required: false
+    aliases: []
+  state:
+    description:
+      - desired state of the resource
+    required: false
+    default: "present"
+    choices: ["running", "stopped", "deleted"]
+    aliases: []
+  datacenter:
+    description:
+     - datacenter location for servers
+     required: true
+     choices: ["paris", "luxembourg", "baltimore"]
+  user:
+    description:
+      - user to create at startup
+      required: true
+      default: null
+  password:
+    description:
+      - user password
+      required: false
+      default: null
+  ssh_key:
+    description:
+      - ssh public key for created user
+      required: false
+      default: null
+
+requirements: [ "libcloud" ]
+author: Aymeric Barantal <mric@gandi.net>
+'''
+
+EXAMPLES = '''
+# Basic provisioning example.  Create a single Debian 7 instance in the
+# paris datacenter
+- local_action:
+    module: gandi
+    name: ansible
+    datacenter: paris
+    machine_type: small
+    image: debian-7
+
+'''
+
+import sys
+
+USER_AGENT_PRODUCT = "Ansible-gandi"
+USER_AGENT_VERSION = "v0.1"
+
+
+try:
+    from libcloud.compute.types import Provider
+    from libcloud.compute.providers import get_driver
+    from libcloud.common.gandi import GandiException
+    _ = Provider.GANDI
+except ImportError:
+    print("failed=True " +
+          "msg='libcloud with Gandi support required for this module'")
+    sys.exit(1)
+
+
+# Load in the libcloud secrets file
+try:
+    import secrets
+except ImportError:
+    secrets = None
+
+
+ARGS = getattr(secrets, 'GANDI_PARAMS', ())
+
+if not ARGS:
+    print("failed=True " +
+          "msg='Missing Gandi connection in libcloud secrets file.'")
+    sys.exit(1)
+
+
+def unexpected_error_msg(error):
+    """Create an error string based on passed in error."""
+    # XXX : better error management
+    return error
+
+
+def get_instance_info(inst):
+    """Retrieves instance information from an instance object and returns it
+    as a dictionary.
+
+    """
+
+    return({
+        'image': not inst.image is None and inst.image or None,
+        # 'cores': inst.cores,
+        # 'ram': inst.memory,
+        'name': inst.name,
+        'public_ip': inst.public_ips[0],
+        'datacenter_id': inst.extra.get('datacenter_id'),
+    })
+
+
+def _get_by_name(name, entities):
+    find = [x for x in entities if x.name == name]
+    return find[0] if find else None
+
+
+def get_image(driver, name, datacenter):
+    """Get an image by name and datacenter location
+    """
+    images = driver.list_images(datacenter)
+    return _get_by_name(name, images)
+
+
+def get_datacenter(driver, name):
+    """Get datacenter by name
+    """
+    dcs = driver.list_locations()
+    return _get_by_name(name, dcs)
+
+
+def get_size(driver, name):
+    sizes = driver.list_sizes()
+    return _get_by_name(name, sizes)
+
+
+def get_node(driver, name):
+    nodes = driver.list_nodes()
+    return _get_by_name(name, nodes)
+
+
+def create_instances(module, driver, instance_names):
+    """Creates new instances. Attributes other than instance_names are picked
+    up from 'module'
+
+    module : AnsibleModule object
+    driver: authenticated libcloud driver on Gandi provider
+    instance_names: python list of instance names to create
+
+    Returns:
+        A list of dictionaries with instance information
+        about the instances that were launched.
+
+    """
+    image = module.params.get('image')
+    machine_type = module.params.get('machine_type')
+    state = module.params.get('state')
+    datacenter = module.params.get('datacenter')
+    user = module.params.get('user')
+    password = module.params.get('password')
+
+    new_instances = []
+    changed = False
+
+    lc_location = get_datacenter(driver, datacenter)
+    if not lc_location:
+        module.fail_json(msg='Invalid datacenter %s' % datacenter,
+                         changed=False)
+    lc_image = get_image(driver, image, lc_location)
+    if not lc_image:
+        module.fail_json(msg='No such image %s on %s' % (image, datacenter),
+                         changed=False)
+    lc_size = get_size(driver, machine_type)
+    if not lc_size:
+        module.fail_json(msg='Invalid machine type %s' % machine_type,
+                         changed=False)
+
+    for name in instance_names:
+        inst = get_node(driver, name)
+        if not inst:
+            try:
+                # XXX : to fix in libcloud
+                lc_size.bandwidth = 102400
+                inst = driver.create_node(name=name,
+                                          size=lc_size,
+                                          image=lc_image,
+                                          location=lc_location,
+                                          login=user,
+                                          password=password)
+                changed = True
+            except GandiException as e:
+                module.fail_json(msg='Unexpected error attempting to create ' +
+                                 'instance %s, error: %s' % (name, e.value))
+
+        if inst:
+            new_instances.append(inst)
+
+    instance_names = []
+    instance_json_data = []
+    for inst in new_instances:
+        d = get_instance_info(inst)
+        instance_names.append(d['name'])
+        instance_json_data.append(d)
+
+    return (changed, instance_json_data, instance_names)
+
+
+def terminate_instances(module, driver, instance_names, zone_name):
+    """Terminates a list of instances.
+
+    module: Ansible module object
+    driver: authenticated Gandi connection object
+    instance_names: a list of instance names to terminate
+
+    Returns a dictionary of instance names that were terminated.
+
+    """
+    changed = False
+    terminated_instance_names = []
+    for name in instance_names:
+        inst = None
+        try:
+            inst = driver.get_node(name)
+        except Exception as e:
+            module.fail_json(msg=unexpected_error_msg(e), changed=False)
+        if inst:
+            driver.destroy_node(inst)
+            terminated_instance_names.append(inst.name)
+            changed = True
+
+    return (changed, terminated_instance_names)
+
+
+def main():
+    module = AnsibleModule(
+        argument_spec=dict(
+            image=dict(default='debian-7'),
+            instance_names=dict(),
+            machine_type=dict(default='small'),
+            name=dict(),
+            state=dict(choices=['running', 'halted', 'deleted'],
+                       default='running'),
+            datacenter=dict(default='paris'),
+            user=dict(),
+            password=dict(),
+            ssh_key=dict(),
+        )
+    )
+
+    image = module.params.get('image')
+    instance_names = module.params.get('instance_names')
+    machine_type = module.params.get('machine_type')
+    name = module.params.get('name')
+    state = module.params.get('state')
+    dc = module.params.get('datacenter')
+    changed = False
+
+    try:
+        gandi = get_driver(Provider.GANDI)(*ARGS)
+        gandi.connection.user_agent_append("%s/%s" % (
+            USER_AGENT_PRODUCT, USER_AGENT_VERSION))
+    except Exception as e:
+        module.fail_json(msg=unexpected_error_msg(e), changed=False)
+
+    inames = []
+    if isinstance(instance_names, list):
+        inames = instance_names
+    elif isinstance(instance_names, str):
+        inames = instance_names.split(',')
+    if name:
+        inames.append(name)
+    if not inames:
+        module.fail_json(msg='Must specify a "name" or "instance_names"',
+                         changed=False)
+    if not dc:
+        module.fail_json(msg='Must specify a "datacenter"', changed=False)
+
+    json_output = {'datacenter': dc}
+    if state in ['deleted']:
+        json_output['state'] = 'deleted'
+        (changed, terminated_instance_names) = \
+            terminate_instances(module, gandi, inames)
+
+        # based on what user specified, return the same variable, although
+        # value could be different if an instance could not be destroyed
+        if instance_names:
+            json_output['instance_names'] = terminated_instance_names
+        elif name:
+            json_output['name'] = name
+
+    elif state in ['running']:
+        json_output['state'] = 'running'
+        (changed, instance_data, instance_name_list) = \
+            create_instances(module, gandi, inames)
+        json_output['instance_data'] = instance_data
+        if instance_names:
+            json_output['instance_names'] = instance_name_list
+        elif name:
+            json_output['name'] = name
+
+    json_output['changed'] = changed
+    print json.dumps(json_output)
+    sys.exit(0)
+
+# this is magic, see lib/ansible/module_common.py
+#<<INCLUDE_ANSIBLE_MODULE_COMMON>>
+
+main()
